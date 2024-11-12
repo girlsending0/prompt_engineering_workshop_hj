@@ -50,7 +50,7 @@ class KMLE:
             "temperature": self.h_params["temperature"],
             "repeatPenalty": self.h_params["repeat_penalty"],
         }
-        return self.hcx.execute(request_data)["content"]
+        return self.hcx.execute(request_data) # ["content"]
 
     async def run_test(self, system_prompt: str, start: int, end: int):
         ans_pattern = r"\((\d+)\)"
@@ -288,7 +288,7 @@ class KMLE:
 
 
 class BananaPunch:
-    def __init__(self, api_key: str, primary_val: str, request_id: str):
+    def __init__(self, api_key: str, apigw_api_key: str, request_id: str):
         self.prompts = load_yaml("prompt/banana.yaml")
         self.questions = load_questions()
         self.api_info = load_yaml("api_info.yaml")
@@ -297,7 +297,7 @@ class BananaPunch:
         self.hcx = CompletionExecutor(
             host=self.h_params["host"],
             api_key=api_key,
-            api_key_primary_val=primary_val,
+            api_key_primary_val=apigw_api_key,
             request_id=request_id,
         )
         self.gpt = AsyncClient(api_key=self.api_info["gpt"]["api_key"])
