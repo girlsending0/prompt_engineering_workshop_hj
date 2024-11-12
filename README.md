@@ -1,1 +1,2 @@
-# prompt_engineering_workshop_hj
+# Prompt WorkShop
+Welcome to the Digital Healthcare Lab Prompt Workshop!

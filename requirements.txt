@@ -1,0 +1,7 @@
+pandas
+openpyxl
+PyYaml
+openai
+jsonlines
+requests
+boto3

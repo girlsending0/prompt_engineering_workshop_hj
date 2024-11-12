@@ -6,6 +6,8 @@ import os
 import re
 import csv
 
+import boto3
+import requests
 import pandas as pd
 from openai import AsyncClient
 
@@ -13,17 +15,23 @@ from src.util import load_questions, load_yaml, load_kmle
 
 
 class KMLE:
-    def __init__(self):
+    def __init__(self, api_key: str, primary_val: str, request_id: str):
         self.kmle = load_kmle()
         self.prompts = self._set_prompt()
         self.api_info = load_yaml("api_info.yaml")
-        self.h_params = self.api_info["hcx"]
+        self.h_params = self.api_info["colab"]
 
-        self.hcx = ChatCompletionExecutor(
+        self.hcx = CompletionExecutor(
             host=self.h_params["host"],
-            client_id=self.h_params["id"],
-            client_secret=self.h_params["secret"],
+            api_key=api_key,
+            api_key_primary_val=primary_val,
+            request_id=request_id,
         )
+
+    def show_questions(self):
+        return pd.DataFrame(self.kmle)[
+            ["problem_category", "question", "options", "answer"]
+        ]
 
     def test(self, prompt: str):
         """
@@ -44,6 +52,60 @@ class KMLE:
         }
         return self.hcx.execute(request_data)["content"]
 
+    async def run_test(self, system_prompt: str, start: int, end: int):
+        ans_pattern = r"\((\d+)\)"
+        message = []
+
+        async def execute_request(prompt: str):
+            request_data = {
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                "maxTokens": self.h_params["max_tokens"],
+                "topP": self.h_params["top_p"],
+                "temperature": self.h_params["temperature"],
+                "repeatPenalty": self.h_params["repeat_penalty"],
+            }
+            response_text = await self.hcx.execute_async(request_data)
+            if "content" in response_text:
+                return response_text["content"]
+
+        tasks = [
+            execute_request(prompt)
+            for _, prompt in enumerate(self.prompts[start : end + 1])
+        ]
+
+        for i in range(0, len(tasks), 5):
+            print(f"Started generating #{i}.")
+            result = await asyncio.gather(*tasks[i : i + 5])
+            message.extend(result)
+            await asyncio.sleep(1)
+
+        df = pd.DataFrame(
+            {
+                "question": [data["question"] for data in self.kmle[start : end + 1]],
+                "options": [data["options"] for data in self.kmle[start : end + 1]],
+                "answer": [
+                    data["answer_idx"][0] for data in self.kmle[start : end + 1]
+                ],
+                "pred_ori": message,
+            }
+        )
+
+        df["pred"] = df["pred_ori"].apply(
+            lambda answer: (
+                re.search(ans_pattern, answer).group(1)
+                if re.search(ans_pattern, answer)
+                else 0
+            )
+        )
+
+        score = (df["pred"] == df["answer"]).sum()
+        print(f"점수: {score}")
+
+        return df
+
     async def run(self, system_prompt: str, file_name: str):
         """
         Generates results for a given set of questions using prompts, and outputs the results as an Excel file.
@@ -53,7 +115,7 @@ class KMLE:
             file_name (str): The name of the Excel file where the results will be saved.
 
         Returns:
-            str: The path to the generated Excel file containing the results.
+            df: generated Excel file containing the results.
         """
         os.makedirs("output", exist_ok=True)
         ans_pattern = r"\((\d+)\)"
@@ -79,9 +141,9 @@ class KMLE:
             execute_request(idx, prompt) for idx, prompt in enumerate(self.prompts)
         ]
 
-        for i in range(0, len(tasks), 10):
+        for i in range(0, len(tasks), 5):
             print(f"Started generating #{i}.")
-            await asyncio.gather(*tasks[i : i + 10])
+            await asyncio.gather(*tasks[i : i + 5])
             await asyncio.sleep(1)
 
         df = pd.DataFrame(
@@ -106,7 +168,59 @@ class KMLE:
 
         df.to_excel(path, index=False)
 
-        return file_name
+        return df
+    
+    async def fill_nan(self, system_prompt: str, file_name: str):
+        ans_pattern = r"\((\d+)\)"
+        df = pd.read_excel(f"output/{file_name}.xlsx")
+        idx = list(df[df["pred_ori"].isna()].index)
+        if not idx:
+            return
+        message = []
+
+        nan_prompt = [self.prompts[i] for i in idx]
+
+        async def execute_request(user_prompt: str):
+            request_data = {
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "maxTokens": self.h_params["max_tokens"],
+                "topP": self.h_params["top_p"],
+                "temperature": self.h_params["temperature"],
+                "repeatPenalty": self.h_params["repeat_penalty"],
+            }
+            response_text = await self.hcx.execute_async(request_data)
+            if "content" in response_text:
+                return response_text["content"]
+
+        tasks = [execute_request(prompt) for _, prompt in enumerate(nan_prompt)]
+
+        for i in range(0, len(tasks), 5):
+            print(f"Started generating #{i}.")
+            result = await asyncio.gather(*tasks[i : i + 5])
+            message.extend(result)
+            await asyncio.sleep(1)
+
+        for i, x in zip(idx, message):
+            df.loc[i, "pred_ori"] = x
+
+        df["pred"] = df["pred_ori"].apply(
+            lambda answer: (
+                int(re.search(ans_pattern, answer).group(1))
+                if re.search(ans_pattern, answer)
+                else 0
+            )
+        )
+
+        score = (df["pred"] == df["answer"]).sum()
+        print(f"점수: {score}")
+
+        path = f"output/{file_name}.xlsx"
+        df.to_excel(path, index=False)
+
+        return df
 
     def _set_prompt(self, kmle=None):
         if not kmle:
@@ -148,10 +262,11 @@ class KMLE:
     def generate_tuning_data(self, system_prompt: str, file_name: str):
         os.makedirs("tuning_data", exist_ok=True)
 
-        kmle = load_kmle(train=True, sampling=True)
+        kmle = load_kmle(train=True)
         prompts = self._set_prompt(kmle)
 
-        f = open(f"tuning_data/{file_name}.csv", "w")
+        path = f"tuning_data/{file_name}.csv"
+        f = open(path, "w")
         writer = csv.writer(f)
 
         writer.writerow(["System_Prompt", "C_ID", "T_ID", "Text", "Completion"])
@@ -161,18 +276,29 @@ class KMLE:
 
         f.close()
 
+        s3 = boto3.client(
+            service_name="s3",
+            endpoint_url="https://kr.object.ncloudstorage.com",
+            region_name="kr-standard",
+            aws_access_key_id=self.h_params["access_key"],
+            aws_secret_access_key=self.h_params["secret_key"],
+        )
+
+        s3.upload_file(path, "dhlab.workshop", file_name + ".csv")
+
 
 class BananaPunch:
-    def __init__(self):
+    def __init__(self, api_key: str, primary_val: str, request_id: str):
         self.prompts = load_yaml("prompt/banana.yaml")
         self.questions = load_questions()
         self.api_info = load_yaml("api_info.yaml")
-        self.h_params = self.api_info["hcx"]
+        self.h_params = self.api_info["colab"]
 
-        self.hcx = ChatCompletionExecutor(
+        self.hcx = CompletionExecutor(
             host=self.h_params["host"],
-            client_id=self.h_params["id"],
-            client_secret=self.h_params["secret"],
+            api_key=api_key,
+            api_key_primary_val=primary_val,
+            request_id=request_id,
         )
         self.gpt = AsyncClient(api_key=self.api_info["gpt"]["api_key"])
 
@@ -195,6 +321,42 @@ class BananaPunch:
         }
         return self.hcx.execute(request_data)["content"]
 
+    async def run_test(self, system_prompt: str, section: str, start: int, end: int):
+        user_prompt = self.prompt_preprocessing(section)[start : end + 1]
+        message = []
+
+        async def execute_request(user_prompt: str):
+            request_data = {
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "maxTokens": self.h_params["max_tokens"],
+                "topP": self.h_params["top_p"],
+                "temperature": self.h_params["temperature"],
+                "repeatPenalty": self.h_params["repeat_penalty"],
+            }
+            response_text = await self.hcx.execute_async(request_data)
+            if "content" in response_text:
+                return response_text["content"]
+
+        tasks = [execute_request(prompt) for _, prompt in enumerate(user_prompt)]
+
+        for i in range(0, len(tasks), 5):
+            print(f"Started generating #{i}.")
+            result = await asyncio.gather(*tasks[i : i + 5])
+            message.extend(result)
+            await asyncio.sleep(1)
+
+        df = self.questions[section][start : end + 1]
+        df.loc[:, "pred"] = message
+
+        if section == "intent_classifier":
+            score = (df["pred"] == df["의도 분류"]).sum()
+            print(f"점수: {score}")
+
+        return df
+
     async def run(self, system_prompt: str, section: str, file_name: str):
         """
         Generates results for a given set of questions using prompts, and outputs the results as an Excel file.
@@ -211,7 +373,7 @@ class BananaPunch:
             file_name (str): The name of the Excel file where the results will be saved.
 
         Returns:
-            str: The file name to the generated Excel file containing the results.
+            DataFrame: The file to the generated Excel file containing the results.
         """
         os.makedirs("output", exist_ok=True)
         user_prompt = self.prompt_preprocessing(section)
@@ -234,9 +396,9 @@ class BananaPunch:
 
         tasks = [execute_request(idx, prompt) for idx, prompt in enumerate(user_prompt)]
 
-        for i in range(0, len(tasks), 10):
+        for i in range(0, len(tasks), 5):
             print(f"Started generating #{i}.")
-            await asyncio.gather(*tasks[i : i + 10])
+            await asyncio.gather(*tasks[i : i + 5])
             await asyncio.sleep(1)
 
         df = self.questions[section]
@@ -249,7 +411,7 @@ class BananaPunch:
         path = f"output/{file_name}.xlsx"
         df.to_excel(path, index=False)
 
-        return file_name
+        return df
 
     async def evaluate(self, file_name: str):
         """
@@ -291,6 +453,51 @@ class BananaPunch:
 
         return path
 
+    async def fill_nan(self, system_prompt: str, section: str, file_name: str):
+        df = pd.read_excel(f"output/{file_name}.xlsx")
+        idx = list(df[df["pred"].isna()].index)
+        if not idx:
+            return
+        message = []
+
+        user_prompt = self.prompt_preprocessing(section)
+        nan_prompt = [user_prompt[i] for i in idx]
+
+        async def execute_request(user_prompt: str):
+            request_data = {
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "maxTokens": self.h_params["max_tokens"],
+                "topP": self.h_params["top_p"],
+                "temperature": self.h_params["temperature"],
+                "repeatPenalty": self.h_params["repeat_penalty"],
+            }
+            response_text = await self.hcx.execute_async(request_data)
+            if "content" in response_text:
+                return response_text["content"]
+
+        tasks = [execute_request(prompt) for _, prompt in enumerate(nan_prompt)]
+
+        for i in range(0, len(tasks), 5):
+            print(f"Started generating #{i}.")
+            result = await asyncio.gather(*tasks[i : i + 5])
+            message.extend(result)
+            await asyncio.sleep(1)
+
+        for i, x in zip(idx, message):
+            df.loc[i, "pred"] = x
+
+        if section == "intent_classifier":
+            score = (df["pred"] == df["의도 분류"]).sum()
+            print(f"점수: {score}")
+
+        path = f"output/{file_name}.xlsx"
+        df.to_excel(path, index=False)
+
+        return df
+
     def prompt_preprocessing(self, section: str):
         questions = self.questions[section]["질문"]
         return [
@@ -313,79 +520,72 @@ class BananaPunch:
         return "바나나펀치에 오신 여러분 환영합니다!"
 
 
-class ChatCompletionExecutor:
-    def __init__(
-        self, host, client_id, client_secret, task_id="HCX-003", access_token=None
-    ):
+class CompletionExecutor:
+    def __init__(self, host, api_key, api_key_primary_val, request_id):
         self._host = host
-        self._client_id = client_id
-        self._client_secret = client_secret
-        self._encoded_secret = base64.b64encode(
-            "{}:{}".format(self._client_id, self._client_secret).encode("utf-8")
-        ).decode("utf-8")
-        self._access_token = access_token
-        self._task_id = task_id
+        self._api_key = api_key
+        self._api_key_primary_val = api_key_primary_val
+        self._request_id = request_id
 
-    def _refresh_access_token(self):
-        headers = {"Authorization": "Basic {}".format(self._encoded_secret)}
-
-        conn = http.client.HTTPSConnection(self._host)
-        conn.request("GET", "/v1/auth/token?existingToken=true", headers=headers)
-        response = conn.getresponse()
-        body = response.read().decode()
-        conn.close()
-
-        token_info = json.loads(body)
-        self._access_token = token_info["result"]["accessToken"]
-
-    def _send_request(self, chat_completion_request):
+    def execute(self, completion_request):
         headers = {
+            "X-NCP-CLOVASTUDIO-API-KEY": self._api_key,
+            "X-NCP-APIGW-API-KEY": self._api_key_primary_val,
+            "X-NCP-CLOVASTUDIO-REQUEST-ID": self._request_id,
             "Content-Type": "application/json; charset=utf-8",
-            "Accept": "text/event-stream",
-            "Authorization": "Bearer {}".format(self._access_token),
         }
 
-        conn = http.client.HTTPSConnection(self._host)
-        if self._task_id == "HCX-003" or self._task_id == "HCX-DASH-001":
-            conn.request(
-                "POST",
-                f"/v1/chat-completions/{self._task_id}",
-                json.dumps(chat_completion_request),
-                headers,
-            )
-        else:
-            conn.request(
-                "POST",
-                f"/v2/tasks/{self._task_id}/chat-completions",
-                json.dumps(chat_completion_request),
-                headers,
-            )
-        response = conn.getresponse()
-        answer = response.read().decode("utf-8")
-        answers = answer.split("\n\n")
-        for answer in answers:
-            if "event:result" in answer:
-                break
-        result = answer.split('"message":')[1]
-        result = result.split("},")[0] + "}"
-        result = result.replace("null", '""')
-        try:
-            result = eval(result)
-        except:
-            result = {"error": answer}
-        conn.close()
-        return result
+        with requests.post(
+            self._host + "/testapp/v1/chat-completions/HCX-003",
+            headers=headers,
+            json=completion_request,
+        ) as r:
+            response = r.content.decode("utf-8")
+            try:
+                result = eval(response)["result"]["message"]
+            except:
+                result = {"error": response}
+            return result
 
-    def execute(self, chat_completion_request):
-        if self._access_token is None:
-            self._refresh_access_token()
+    async def execute_async(self, completion_request):
+        max_tries = 5
+        try_cnt = 0
 
-        res = self._send_request(chat_completion_request)
-        return res
+        while try_cnt < max_tries:
+            headers = {
+                "X-NCP-CLOVASTUDIO-API-KEY": self._api_key,
+                "X-NCP-APIGW-API-KEY": self._api_key_primary_val,
+                "X-NCP-CLOVASTUDIO-REQUEST-ID": self._request_id,
+                "Content-Type": "application/json; charset=utf-8",
+            }
+            with requests.post(
+                self._host + "/testapp/v1/chat-completions/HCX-003",
+                headers=headers,
+                json=completion_request,
+            ) as r:
+                response = r.content.decode("utf-8")
+                try:
+                    # result = eval(response)["result"]["message"]
+                    result = eval(response)
+                    if result["status"]["code"] in [40100, 40101, 40102, 40103, 40104]:
+                        raise ValueError("Authorization Error. Please check API Key")
+                    elif result["status"]["code"] in [
+                        "40400",
+                        "42900",
+                        "42901",
+                        "50000",
+                    ]:
+                        try_cnt += 1
+                    elif result["status"]["message"] != "OK":
+                        raise ValueError(
+                            f"Error: {result['status']['message']}({result['status']['code']})"
+                        )
+                    elif "content" not in result["result"]["message"]:
+                        try_cnt += 1
+                    else:
+                        return result["result"]["message"]
+                except:
+                    try_cnt += 1
+                await asyncio.sleep(2)
 
-    async def execute_async(self, chat_completion_request):
-        if self._access_token is None:
-            self._refresh_access_token()
-
-        res = self._send_request(chat_completion_request)
-        return res
+        return {"error": response}

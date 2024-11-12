@@ -12,134 +12,117 @@ import re
 from tqdm import tqdm
 import yaml
 import time
-import time
+import hashlib
+import hmac
 
 
 class CreateTaskExecutor:
-    def __init__(self, host, client_id, client_secret, access_token=None):
+    def __init__(self, host, uri, method, iam_access_key, secret_key, request_id):
         self._host = host
-        # client_id and client_secret are used to issue access_token.
-        # You should not share this with others.
-        self._client_id = client_id
-        self._client_secret = client_secret
-        # Base64Encode(client_id:client_secret)
-        self._encoded_secret = base64.b64encode(
-            "{}:{}".format(self._client_id, self._client_secret).encode("utf-8")
-        ).decode("utf-8")
-        self._access_token = access_token
+        self._uri = uri
+        self._method = method
+        self._api_gw_time = str(int(time.time() * 1000))
+        self._iam_access_key = iam_access_key
+        self._secret_key = secret_key
+        self._request_id = request_id
 
-    def _refresh_access_token(self):
-        headers = {"Authorization": "Basic {}".format(self._encoded_secret)}
-
-        conn = http.client.HTTPSConnection(self._host)
-        # If existingToken is true, it returns a token that has the longest expiry time among existing tokens.
-        conn.request("GET", "/v1/auth/token?existingToken=true", headers=headers)
-        response = conn.getresponse()
-        body = response.read().decode()
-        conn.close()
-
-        token_info = json.loads(body)
-        self._access_token = token_info["result"]["accessToken"]
-
-    def _send_request(self, create_task_request):
-        headers = {"Authorization": "Bearer {}".format(self._access_token)}
-        files = {
-            "trainingDataset": (
-                create_task_request["trainingDataset"].split("/")[-1],
-                open(create_task_request["trainingDataset"], "rb"),
-            )
-        }
-        data = {
-            key: value
-            for key, value in create_task_request.items()
-            if key != "trainingDataset"
-        }
-
-        response = requests.post(
-            f"https://{self._host}/v2/tasks", headers=headers, data=data, files=files
+    def _make_signature(self):
+        secret_key = bytes(self._secret_key, "UTF-8")
+        message = (
+            self._method
+            + " "
+            + self._uri
+            + "\n"
+            + self._api_gw_time
+            + "\n"
+            + self._iam_access_key
         )
-        return response.json()
+        message = bytes(message, "UTF-8")
+        signing_key = base64.b64encode(
+            hmac.new(secret_key, message, digestmod=hashlib.sha256).digest()
+        )
+        return signing_key
 
-    def execute(self, create_task_request):
-        if self._access_token is None:
-            self._refresh_access_token()
+    def _send_request(self, create_request):
 
-        res = self._send_request(create_task_request)
-        if res["status"]["code"] == "40103":
-            # Check whether the token has expired and reissue the token.
-            self._access_token = None
-            return self.execute(create_task_request)
-        elif res["status"]["code"] == "20000":
+        headers = {
+            "X-NCP-APIGW-TIMESTAMP": self._api_gw_time,
+            "X-NCP-IAM-ACCESS-KEY": self._iam_access_key,
+            "X-NCP-APIGW-SIGNATURE-V2": self._make_signature(),
+            "X-NCP-CLOVASTUDIO-REQUEST-ID": self._request_id,
+        }
+        result = requests.post(
+            self._host + self._uri, json=create_request, headers=headers
+        ).json()
+        return result
+
+    def execute(self, create_request):
+        res = self._send_request(create_request)
+        if "status" in res and res["status"]["code"] == "20000":
             return res["result"]
         else:
-            return "Error"
+            return res
 
 
 class FindTaskExecutor:
-    def __init__(self, host, client_id, client_secret, task_id, access_token=None):
+    def __init__(self, host, uri, method, iam_access_key, secret_key, request_id):
         self._host = host
-        # client_id and client_secret are used to issue access_token.
-        # You should not share this with others.
-        self._client_id = client_id
-        self._client_secret = client_secret
-        # Base64Encode(client_id:client_secret)
-        self._encoded_secret = base64.b64encode(
-            "{}:{}".format(self._client_id, self._client_secret).encode("utf-8")
-        ).decode("utf-8")
-        self._access_token = access_token
-        self._task_id = task_id
+        self._uri = uri
+        self._method = method
+        self._api_gw_time = str(int(time.time() * 1000))
+        self._iam_access_key = iam_access_key
+        self._secret_key = secret_key
+        self._request_id = request_id
 
-    def _refresh_access_token(self):
-        headers = {"Authorization": "Basic {}".format(self._encoded_secret)}
+    def _make_signature(self, task_id):
+        secret_key = bytes(self._secret_key, "UTF-8")
+        message = (
+            self._method
+            + " "
+            + self._uri
+            + task_id
+            + "\n"
+            + self._api_gw_time
+            + "\n"
+            + self._iam_access_key
+        )
+        message = bytes(message, "UTF-8")
+        signing_key = base64.b64encode(
+            hmac.new(secret_key, message, digestmod=hashlib.sha256).digest()
+        )
+        return signing_key
 
-        conn = http.client.HTTPSConnection(self._host)
-        # If existingToken is true, it returns a token that has the longest expiry time among existing tokens.
-        conn.request("GET", "/v1/auth/token?existingToken=true", headers=headers)
-        response = conn.getresponse()
-        body = response.read().decode()
-        conn.close()
-
-        token_info = json.loads(body)
-        self._access_token = token_info["result"]["accessToken"]
-
-    def _send_request(self, find_task_request):
+    def _send_request(self, task_id):
         headers = {
             "Content-Type": "application/json; charset=utf-8",
-            "Authorization": "Bearer {}".format(self._access_token),
+            "X-NCP-APIGW-TIMESTAMP": self._api_gw_time,
+            "X-NCP-IAM-ACCESS-KEY": self._iam_access_key,
+            "X-NCP-APIGW-SIGNATURE-V2": self._make_signature(task_id),
+            "X-NCP-CLOVASTUDIO-REQUEST-ID": self._request_id,
         }
 
-        conn = http.client.HTTPSConnection(self._host)
-        conn.request(
-            "GET", f"/v2/tasks/{self._task_id}", json.dumps(find_task_request), headers
-        )
-        response = conn.getresponse()
-        result = json.loads(response.read().decode(encoding="utf-8"))
-        conn.close()
+        result = requests.get(self._host + self._uri + task_id, headers=headers).json()
         return result
 
-    def execute(self, find_task_request):
-        if self._access_token is None:
-            self._refresh_access_token()
-
-        res = self._send_request(find_task_request)
-        if res["status"]["code"] == "40103":
-            # Check whether the token has expired and reissue the token.
-            self._access_token = None
-            return self.execute(find_task_request)
-        elif res["status"]["code"] == "20000":
+    def execute(self, taskId):
+        res = self._send_request(taskId)
+        if "status" in res and res["status"]["code"] == "20000":
             return res["result"]
         else:
-            return "Error"
+            return res
 
 
 def create_task(file_name: str):
     with open("api_info.yaml") as f:
-        h_params = yaml.load(f, Loader=yaml.FullLoader)["hcx_tuning"]
+        h_params = yaml.load(f, Loader=yaml.FullLoader)["colab"]
 
-    create_task_executor = CreateTaskExecutor(
-        host="api-hyperclova.navercorp.com",
-        client_id=h_params["id"],
-        client_secret=h_params["secret"],
+    completion_executor = CreateTaskExecutor(
+        host="https://clovastudio.apigw.ntruss.com",
+        uri="/tuning/v2/tasks",
+        method="POST",
+        iam_access_key=h_params["access_key"],
+        secret_key=h_params["secret_key"],
+        request_id=h_params["request_id"][0],
     )
 
     request_data = {
@@ -149,27 +132,31 @@ def create_task(file_name: str):
         "taskType": "GENERATION",
         "trainEpochs": 4,
         "learningRate": 1e-4,
-        "trainingDataset": f"tuning_data/{file_name}.csv",
+        "trainingDatasetBucket": "dhlab.workshop",
+        "trainingDatasetFilePath": file_name + ".csv",
+        "trainingDatasetAccessKey": h_params["access_key"],
+        "trainingDatasetSecretKey": h_params["secret_key"],
     }
 
-    response = create_task_executor.execute(request_data)
+    response = completion_executor.execute(request_data)
     print(response)
+    return response
 
 
 def find_task(task_id: str):
     with open("api_info.yaml") as f:
-        h_params = yaml.load(f, Loader=yaml.FullLoader)["hcx_tuning"]
+        h_params = yaml.load(f, Loader=yaml.FullLoader)["colab"]
 
-    find_task_executor = FindTaskExecutor(
-        host="api-hyperclova.navercorp.com",
-        client_id=h_params["id"],
-        client_secret=h_params["secret"],
-        task_id=task_id,
+    completion_executor = FindTaskExecutor(
+        host="https://clovastudio.apigw.ntruss.com",
+        uri="/tuning/v2/tasks/",
+        method="GET",
+        iam_access_key=h_params["access_key"],
+        secret_key=h_params["secret_key"],
+        request_id=h_params["request_id"][0],
     )
 
-    request_data = {}
-
-    response = find_task_executor.execute(request_data)
+    response = completion_executor.execute(task_id)
     print(response)
 
 
