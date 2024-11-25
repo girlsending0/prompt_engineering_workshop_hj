@@ -288,7 +288,7 @@ class KMLE:
 
 
 class BananaPunch:
-    def __init__(self, api_key: str, apigw_api_key: str, request_id: str):
+    def __init__(self, api_key: str, apigw_api_key: str, request_id: str, gpt_key: str):
         self.prompts = load_yaml("prompt/banana.yaml")
         self.questions = load_questions()
         self.api_info = load_yaml("api_info.yaml")
@@ -300,7 +300,7 @@ class BananaPunch:
             api_key_primary_val=apigw_api_key,
             request_id=request_id,
         )
-        self.gpt = AsyncClient(api_key=self.api_info["gpt"]["api_key"])
+        self.gpt = AsyncClient(api_key=gpt_key)
 
     def test(self, prompt: str):
         """
