@@ -42,6 +42,3 @@ colab:
   top_p: 0.8
   repeat_penalty: 5
   temperature: 0.1
-
-gpt:
-  api_key: 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
