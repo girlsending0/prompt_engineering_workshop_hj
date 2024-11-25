@@ -293,6 +293,7 @@ class BananaPunch:
         self.questions = load_questions()
         self.api_info = load_yaml("api_info.yaml")
         self.h_params = self.api_info["colab"]
+        self.gpt_key = gpt_key
 
         self.hcx = CompletionExecutor(
             host=self.h_params["host"],
@@ -300,7 +301,7 @@ class BananaPunch:
             api_key_primary_val=apigw_api_key,
             request_id=request_id,
         )
-        self.gpt = AsyncClient(api_key=gpt_key)
+        self.gpt = AsyncClient(api_key=self.gpt_key)
 
     def test(self, prompt: str):
         """
